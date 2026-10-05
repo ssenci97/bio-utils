@@ -53,7 +53,6 @@ def load_all_refseqs(*search_paths):
         p = Path(path_str)
         if not p.exists():
             continue
-
         files = [p] if p.is_file() else list(p.rglob("*.fasta")) + list(p.rglob("*.fa")) + list(p.rglob("*.faa"))
         for f in files:
             try:
@@ -73,36 +72,27 @@ def parse_alignment_file(aln_path):
         df = pd.read_csv(aln_path, sep=r"\s+|\t|,", engine="python")
     except Exception:
         return None
-
     if not {"posref", "posalt"}.issubset(set(df.columns)):
         return None
-
     df["posref"] = pd.to_numeric(df["posref"], errors="coerce")
     df["posalt"] = pd.to_numeric(df["posalt"], errors="coerce")
-
     ref_df = df.dropna(subset=["posref"]).copy()
     if ref_df.empty:
         return None
-
     ref_df["posref"] = ref_df["posref"].astype(int)
-
     stem = aln_path.stem.replace("_positions", "")
     parts = stem.split("_")
     pdb_id = parts[0].lower()
     chain_id = parts[1] if len(parts) > 1 else "A"
-
     min_posref = int(ref_df["posref"].min())
     max_posref = int(ref_df["posref"].max())
-
     ref_seq_dict = {}
     if "ref" in ref_df.columns:
         for _, row in ref_df.iterrows():
             ref_seq_dict[int(row["posref"])] = str(row["ref"]).upper()
-
     pdb_df = ref_df.dropna(subset=["posalt"]).copy()
     pdb_df["posalt"] = pdb_df["posalt"].astype(int)
     pdb_ref_pos = set(pdb_df["posref"])
-
     return {
         "pdb_id": pdb_id,
         "chain_id": chain_id,
@@ -138,6 +128,94 @@ def finish_log(start_time, msg):
     dt = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[PYTHON-INFO] {dt} | {msg} | execution time: {elapsed:.2f}s | max memory: {mem_mb:.1f} MB")
 
+###################################### DEDUPLICATION AND MERGING
+def align_and_merge(r1, r2):
+    s1, c1 = r1["sequence"], r1["contacts"]
+    s2, c2 = r2["sequence"], r2["contacts"]
+    l1, l2 = len(s1), len(s2)
+    best_off = None
+    for off in range(-20, 21):
+        st1, en1 = max(0, off), min(l1, l2 + off)
+        st2, en2 = max(0, -off), min(l2, l1 - off)
+        if en1 <= st1:
+            continue
+        match = True
+        for i, j in zip(range(st1, en1), range(st2, en2)):
+            if s1[i] != "X" and s2[j] != "X" and s1[i] != s2[j]:
+                match = False
+                break
+        if match:
+            best_off = off
+            break
+    if best_off is None:
+        return None
+    off = best_off
+    shift1 = -min(0, off)
+    shift2 = off - min(0, off)
+    new_len = max(l1 + shift1, l2 + shift2)
+    seq_chars, con_chars = [], []
+    for k in range(new_len):
+        i1, i2 = k - shift1, k - shift2
+        ch1 = s1[i1] if 0 <= i1 < l1 else "X"
+        ch2 = s2[i2] if 0 <= i2 < l2 else "X"
+        seq_chars.append(ch1 if ch1 != "X" else ch2)
+        ct1 = c1[i1] if 0 <= i1 < l1 else "X"
+        ct2 = c2[i2] if 0 <= i2 < l2 else "X"
+        if ct1 == "1" or ct2 == "1":
+            con_chars.append("1")
+        elif ct1 == "0" or ct2 == "0":
+            con_chars.append("0")
+        else:
+            con_chars.append("X")
+    return "".join(seq_chars), "".join(con_chars)
+
+def deduplicate_records(records, dedup_max=False):
+    groups = {}
+    if dedup_max:
+        groups["ALL"] = records
+    else:
+        for r in records:
+            groups.setdefault(r["complex"], []).append(r)
+    final_rows = []
+    for grp_recs in tqdm(groups.values(), desc="Deduplicating clusters"):
+        active = grp_recs[:]
+        changed = True
+        while changed:
+            changed = False
+            new_active = []
+            skip = set()
+            for i in range(len(active)):
+                if i in skip:
+                    continue
+                curr = active[i]
+                for j in range(i + 1, len(active)):
+                    if j in skip:
+                        continue
+                    target = active[j]
+                    merged_res = align_and_merge(curr, target)
+                    if merged_res is not None:
+                        m_seq, m_con = merged_res
+                        c_ids = curr["chain_ids"] + [c for c in target["chain_ids"] if c not in curr["chain_ids"]]
+                        if dedup_max:
+                            new_id = f"{curr['id']}_{target['id']}"
+                            new_cmplx = f"{curr['complex']}_{target['complex']}"
+                        else:
+                            new_id = f"{curr['complex']}_{'_'.join(c_ids)}"
+                            new_cmplx = curr["complex"]
+                        curr = {
+                            "complex": new_cmplx,
+                            "id": new_id,
+                            "sequence": m_seq,
+                            "contacts": m_con,
+                            "chain_ids": c_ids,
+                        }
+                        skip.add(j)
+                        changed = True
+                new_active.append(curr)
+            active = new_active
+        final_rows.extend(active)
+    return final_rows
+
 ###################################### MAIN EXECUTION
 def main():
     start = time.perf_counter()
@@ -153,6 +231,8 @@ def main():
         help="Type of contacts to process: 'inter' (default), 'intra', or 'all'",
     )
     parser.add_argument("-j", "--json", nargs="?", const=DEFAULT_CONFIG_PATH, default=DEFAULT_CONFIG_PATH, help="Path to config JSON")
+    parser.add_argument("--dedup", action="store_true", help="Group by sequence within same PDB and concatenate chain IDs")
+    parser.add_argument("--dedup-max", action="store_true", help="Group by sequence bypassing chain IDs across all PDBs")
     args = parser.parse_args()
 
     defaults = {
@@ -282,11 +362,17 @@ def main():
             "id": f"{pdb_id}_{chain_id}",
             "sequence": extracted_sequence,
             "contacts": contacts_str,
+            "chain_ids": [chain_id],
         })
         processed_keys.add(chain_key)
 
+    if args.dedup_max:
+        rows = deduplicate_records(rows, dedup_max=True)
+    elif args.dedup:
+        rows = deduplicate_records(rows, dedup_max=False)
+
     if rows:
-        out_df = pd.DataFrame(rows)
+        out_df = pd.DataFrame(rows)[["complex", "id", "sequence", "contacts"]]
         out_df.to_csv(out_file, index=False)
         summary_msg = f"Saved {len(out_df)} chain contact sequences to CSV format at {out_file}"
     else:
@@ -296,4 +382,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
