@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --partition=EPYC
+#SBATCH --partition=GENOA
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -25,4 +25,9 @@ echo "$SEPARATOR [Ca-Ca CONTACTS]"
 python3 src/05_compute_pdb_contacts.py
 echo "$SEPARATOR [Bonus: CONTACT SUMMARIZATION]"
 python3 src/06_summarize_contacts.py
+echo "$SEPARATOR"
+python3 src/06_summarize_contacts.py --dedup
+echo "$SEPARATOR"
+python3 src/06_summarize_contacts.py --dedup-max
+echo "$SEPARATOR [Bonus: Plot Chains Coverage]"
 python3 src/plot_coverage.py

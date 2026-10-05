@@ -257,6 +257,10 @@ def main():
     else:
         out_file = contacts_dir / f"contacts_sequences_{contact_type}.csv"
 
+    tag = "_dedup_max" if args.dedup_max else ("_dedup" if args.dedup else "")
+    if tag and not out_file.stem.endswith(tag):
+        out_file = out_file.with_name(f"{out_file.stem}{tag}{out_file.suffix}")
+
     if out_file.suffix.lower() != ".csv":
         out_file = out_file.with_suffix(".csv")
 
