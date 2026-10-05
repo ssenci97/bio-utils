@@ -82,7 +82,7 @@ def parse_alignment_file(aln_path):
     ref_df["posref"] = ref_df["posref"].astype(int)
     stem = aln_path.stem.replace("_positions", "")
     parts = stem.split("_")
-    pdb_id = parts[0].lower()
+    pdb_id = parts[0].upper()
     chain_id = parts[1] if len(parts) > 1 else "A"
     min_posref = int(ref_df["posref"].min())
     max_posref = int(ref_df["posref"].max())
@@ -105,11 +105,18 @@ def parse_alignment_file(aln_path):
     }
 
 def load_contacts_for_pdb(contacts_dir, pdb_id, contact_type="inter"):
+    pdb_lower = pdb_id.lower()
     candidates = [
+        contacts_dir / f"{pdb_lower}_contacts_{contact_type}.tsv",
+        contacts_dir / f"{pdb_lower}_contacts_{contact_type}.csv",
         contacts_dir / f"{pdb_id}_contacts_{contact_type}.tsv",
         contacts_dir / f"{pdb_id}_contacts_{contact_type}.csv",
+        contacts_dir / f"{pdb_lower}_contacts.tsv",
+        contacts_dir / f"{pdb_lower}_contacts.csv",
         contacts_dir / f"{pdb_id}_contacts.tsv",
         contacts_dir / f"{pdb_id}_contacts.csv",
+        contacts_dir / f"{pdb_lower}.tsv",
+        contacts_dir / f"{pdb_lower}.csv",
         contacts_dir / f"{pdb_id}.tsv",
         contacts_dir / f"{pdb_id}.csv",
     ]
@@ -128,7 +135,44 @@ def finish_log(start_time, msg):
     dt = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[PYTHON-INFO] {dt} | {msg} | execution time: {elapsed:.2f}s | max memory: {mem_mb:.1f} MB")
 
-###################################### DEDUPLICATION AND MERGING
+###################################### DEDUPLICATION AND MERGING FORMATTING
+def format_complex_and_id(pdb_chains):
+    """
+    Format unique upper-case complex IDs and tidy ID string.
+    pdb_chains: dict mapping pdb_id -> list/set of chain_ids
+    Returns: (complex_str, id_str)
+    e.g. complex_str = "1ABC_2XYZ"
+         id_str      = "1ABC-AB_2XYZ-C"
+    """
+    sorted_pdbs = sorted(set(p.upper() for p in pdb_chains.keys()))
+    complex_str = "_".join(sorted_pdbs)
+    
+    id_parts = []
+    for pdb_id in sorted_pdbs:
+        chains = []
+        for k, v in pdb_chains.items():
+            if k.upper() == pdb_id:
+                chains.extend(v)
+        unique_chains = sorted(set(chains))
+        chains_str = "".join(unique_chains)
+        id_parts.append(f"{pdb_id}-{chains_str}")
+    id_str = "_".join(id_parts)
+    
+    return complex_str, id_str
+
+def merge_pdb_chains(dict1, dict2):
+    """Merge two pdb_chains dictionaries preserving unique chain IDs per uppercase PDB."""
+    merged = {}
+    for d in (dict1, dict2):
+        for pdb_id, chains in d.items():
+            p_upper = pdb_id.upper()
+            if p_upper not in merged:
+                merged[p_upper] = []
+            for c in chains:
+                if c not in merged[p_upper]:
+                    merged[p_upper].append(c)
+    return merged
+
 def align_and_merge(r1, r2):
     s1, c1 = r1["sequence"], r1["contacts"]
     s2, c2 = r2["sequence"], r2["contacts"]
@@ -195,19 +239,14 @@ def deduplicate_records(records, dedup_max=False):
                     merged_res = align_and_merge(curr, target)
                     if merged_res is not None:
                         m_seq, m_con = merged_res
-                        c_ids = curr["chain_ids"] + [c for c in target["chain_ids"] if c not in curr["chain_ids"]]
-                        if dedup_max:
-                            new_id = f"{curr['id']}_{target['id']}"
-                            new_cmplx = f"{curr['complex']}_{target['complex']}"
-                        else:
-                            new_id = f"{curr['complex']}_{'_'.join(c_ids)}"
-                            new_cmplx = curr["complex"]
+                        merged_chains = merge_pdb_chains(curr["pdb_chains"], target["pdb_chains"])
+                        new_cmplx, new_id = format_complex_and_id(merged_chains)
                         curr = {
                             "complex": new_cmplx,
                             "id": new_id,
                             "sequence": m_seq,
                             "contacts": m_con,
-                            "chain_ids": c_ids,
+                            "pdb_chains": merged_chains,
                         }
                         skip.add(j)
                         changed = True
@@ -333,7 +372,7 @@ def main():
                     aln_df[aln_df["posalt"].isin(structure_contact_pos)]["posref"].astype(int)
                 )
 
-        full_refseq = refseq_map.get(chain_key) or refseq_map.get(pdb_id)
+        full_refseq = refseq_map.get(chain_key) or refseq_map.get(pdb_id.lower()) or refseq_map.get(pdb_id)
 
         if full_refseq:
             start_idx = max(0, min_pos - 1)
@@ -361,12 +400,15 @@ def main():
 
         contacts_str = "".join(contact_bits)
 
+        pdb_chains = {pdb_id: [chain_id]}
+        cmplx, rec_id = format_complex_and_id(pdb_chains)
+
         rows.append({
-            "complex": pdb_id,
-            "id": f"{pdb_id}_{chain_id}",
+            "complex": cmplx,
+            "id": rec_id,
             "sequence": extracted_sequence,
             "contacts": contacts_str,
-            "chain_ids": [chain_id],
+            "pdb_chains": pdb_chains,
         })
         processed_keys.add(chain_key)
 
